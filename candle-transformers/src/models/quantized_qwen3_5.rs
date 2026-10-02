@@ -483,9 +483,16 @@ impl GatedDeltaNetWeights {
             self.neg_a_f32.broadcast_mul(&softplus)?
         };
 
+        // Each k head serves num_v_heads / num_k_heads value heads. llama.cpp's
+        // GGUF converter orders the value heads so the k heads are *tiled*
+        // (ggml_repeat: k0..k15, k0..k15, ...), not interleaved like the
+        // Hugging Face weights (repeat_interleave: k0, k0, k0, k1, ...). With
+        // interleaving, Qwen3.8-27B (48 value heads over 16 k heads) emits
+        // <|im_end|> at once; tiled, it answers coherently. Models with equal
+        // head counts (Qwen3.5-0.8B) can't tell the difference.
         let repeat_n = self.num_v_heads / self.num_k_heads;
-        let q = repeat_interleave(&q, repeat_n, 2)?;
-        let k = repeat_interleave(&k, repeat_n, 2)?;
+        let q = q.repeat((1, 1, repeat_n, 1))?;
+        let k = k.repeat((1, 1, repeat_n, 1))?;
 
         let initial_state = if use_precomputed_states {
             self.recurrent_state.as_ref()
@@ -515,19 +522,6 @@ impl GatedDeltaNetWeights {
     }
 }
 
-fn repeat_interleave(img: &Tensor, repeats: usize, dim: usize) -> Result<Tensor> {
-    if repeats == 1 {
-        return Ok(img.clone());
-    }
-    let mut dims = img.dims().to_vec();
-    dims[dim] *= repeats;
-    let final_dims = dims.clone();
-    let img = img.unsqueeze(dim + 1)?;
-    let mut expand_dims = img.dims().to_vec();
-    expand_dims[dim + 1] = repeats;
-    let expanded = img.expand(expand_dims.as_slice())?;
-    expanded.reshape(final_dims.as_slice())
-}
 
 #[derive(Debug, Clone)]
 enum TokenMixer {
@@ -660,7 +654,17 @@ impl ModelWeights {
         let key_length = md_get("qwen3.attention.key_length")?.to_u32()? as usize;
 
         let head_dim = key_length;
-        let num_layers = md_get("qwen3.block_count")?.to_u32()? as usize;
+        // `block_count` also counts the multi-token-prediction ("nextn") layers
+        // that Qwen3.6+ GGUFs carry for speculative decoding (Qwen3.8-27B: 64
+        // + 1, the extra one at blk.64). They are not part of the forward pass.
+        let block_count = md_get("qwen3.block_count")?.to_u32()? as usize;
+        let nextn_layers = md_get("qwen3.nextn_predict_layers")
+            .and_then(|value| value.to_u32())
+            .map(|value| value as usize)
+            .unwrap_or(0);
+        let Some(num_layers) = block_count.checked_sub(nextn_layers) else {
+            candle::bail!("block_count {block_count} < nextn_predict_layers {nextn_layers}")
+        };
         let hidden_size = md_get("qwen3.embedding_length")?.to_u32()? as usize;
         let max_position_embeddings = md_get("qwen3.context_length")?.to_u32()? as usize;
         let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
