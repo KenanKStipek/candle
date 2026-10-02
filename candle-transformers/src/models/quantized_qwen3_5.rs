@@ -133,17 +133,14 @@ impl RotaryEmbedding {
             if self.rotary_dim == x.dim(D::Minus1)? {
                 Ok(rotated)
             } else {
-                Tensor::cat(
-                    &[
-                        &rotated,
-                        &x.narrow(
-                            D::Minus1,
-                            self.rotary_dim,
-                            x.dim(D::Minus1)? - self.rotary_dim,
-                        )?,
-                    ],
-                    D::Minus1,
-                )
+                // Both halves contiguous, so `cat` takes its contiguous path. With
+                // a strided pass-through half it concatenates via transposes and
+                // leaves q laid out [d][h][s], which Metal's matmul rejects
+                // ("Invalid matmul arguments") on candle 0.10.2.
+                let pass = x
+                    .narrow(D::Minus1, self.rotary_dim, x.dim(D::Minus1)? - self.rotary_dim)?
+                    .contiguous()?;
+                Tensor::cat(&[&rotated, &pass], D::Minus1)
             }
         };
         let q_embed = apply(q)?;
