@@ -1,5 +1,7 @@
+use crate::models::qwen3_5_linear_attn_scan::{
+    depthwise_conv1d, gated_delta_rule_chunked, sequential_step,
+};
 use crate::models::with_tracing::{linear_b, linear_no_bias, Linear};
-use crate::models::qwen3_5_linear_attn_scan::depthwise_conv1d;
 use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{conv1d_no_bias, Activation, Conv1d, Conv1dConfig, VarBuilder};
 use std::sync::Arc;
@@ -91,6 +93,10 @@ fn default_partial_rotary_factor() -> f64 {
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct RopeParameters {
     pub rope_theta: f64,
+    /// Where the Qwen 3.5 configs put it (`text_config.rope_parameters`); it
+    /// overrides `TextConfig::partial_rotary_factor` when present.
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f64>,
 }
 
 impl Config {
@@ -102,6 +108,13 @@ impl Config {
 
     pub fn rope_theta(&self) -> f64 {
         self.text_config.rope_parameters.rope_theta
+    }
+
+    pub fn partial_rotary_factor(&self) -> f64 {
+        self.text_config
+            .rope_parameters
+            .partial_rotary_factor
+            .unwrap_or(self.text_config.partial_rotary_factor)
     }
 }
 
@@ -135,6 +148,16 @@ impl Qwen3_5RmsNorm {
 fn l2_norm(x: &Tensor) -> Result<Tensor> {
     let inv_norm = (x.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?.recip()?;
     x.broadcast_mul(&inv_norm)
+}
+
+/// `[1, ...]` -> `[n, ...]`: one cached prefix shared by `n` rows of a batch.
+fn repeat_batch(t: &Tensor, n: usize) -> Result<Tensor> {
+    let mut dims = t.dims().to_vec();
+    if dims.first() != Some(&1) {
+        candle::bail!("repeat_cache needs a batch-1 cache, got {:?}", t.shape())
+    }
+    dims[0] = n;
+    t.broadcast_as(dims)?.contiguous()
 }
 
 fn repeat_interleave(x: &Tensor, n: usize, dim: usize) -> Result<Tensor> {
@@ -314,7 +337,11 @@ impl Qwen3_5GatedDeltaNet {
         hidden_states.broadcast_mul(&gate_silu)
     }
 
-    fn torch_recurrent_gated_delta_rule(
+    /// The gated delta rule over `seq_len` tokens from `initial_state` (zeros
+    /// when absent): one sequential step for a single token, the chunked scan
+    /// otherwise. Inputs `[b, t, h, d]`, gates `[b, t, h]`; returns the output
+    /// `[b, t, h, v]` and the final state `[b, h, k, v]`, both f32.
+    fn gated_delta_rule(
         &self,
         query: &Tensor,
         key: &Tensor,
@@ -323,26 +350,16 @@ impl Qwen3_5GatedDeltaNet {
         beta: &Tensor,
         initial_state: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        let query = l2_norm(query)?;
-        let key = l2_norm(key)?;
-
-        // Keep in initial_dtype (usually BF16) if possible, but core update might need F32 for stability
-        let query = query.transpose(1, 2)?; // (batch, heads, seq, dim)
-        let key = key.transpose(1, 2)?;
-        let value = value.transpose(1, 2)?;
-        let beta = beta.transpose(1, 2)?;
-        let g = g.transpose(1, 2)?;
-
-        let (batch_size, num_heads, seq_len, k_head_dim) = key.dims4()?;
+        let query = l2_norm(&query.to_dtype(DType::F32)?)?;
+        let key = l2_norm(&key.to_dtype(DType::F32)?)?;
+        let (batch_size, seq_len, num_heads, k_head_dim) = key.dims4()?;
         let v_head_dim = value.dim(3)?;
+        let query = (query * (1.0 / (k_head_dim as f64).sqrt()))?;
+        let value = value.to_dtype(DType::F32)?;
+        let beta = beta.to_dtype(DType::F32)?;
+        let log_g = g.to_dtype(DType::F32)?;
 
-        let scale = 1.0 / (query.dim(3)? as f64).sqrt();
-        let query = (query * scale)?;
-
-        let mut core_attn_out_vec = Vec::with_capacity(seq_len);
-
-        // We MUST use F32 for the recurrent state to avoid numerical drift
-        let mut last_recurrent_state = match initial_state {
+        let mut state = match initial_state {
             Some(state) => state.to_dtype(DType::F32)?,
             None => Tensor::zeros(
                 (batch_size, num_heads, k_head_dim, v_head_dim),
@@ -350,38 +367,20 @@ impl Qwen3_5GatedDeltaNet {
                 query.device(),
             )?,
         };
-
-        // Move loop-invariant conversions outside and prepare dimensions
-        let query_f32 = query.to_dtype(DType::F32)?;
-        let key_f32 = key.to_dtype(DType::F32)?;
-        let value_f32 = value.to_dtype(DType::F32)?;
-        let g_exp = g.to_dtype(DType::F32)?.exp()?.unsqueeze(3)?; // (B, H, S, 1)
-        let beta_f32 = beta.to_dtype(DType::F32)?.unsqueeze(3)?; // (B, H, S, 1)
-
-        for i in 0..seq_len {
-            let q_t = query_f32.narrow(2, i, 1)?; // (B, H, 1, K)
-            let k_t = key_f32.narrow(2, i, 1)?; // (B, H, 1, K)
-            let v_t = value_f32.narrow(2, i, 1)?; // (B, H, 1, V)
-            let g_t = g_exp.narrow(2, i, 1)?; // (B, H, 1, 1)
-            let beta_t = beta_f32.narrow(2, i, 1)?; // (B, H, 1, 1)
-
-            last_recurrent_state = last_recurrent_state.broadcast_mul(&g_t)?;
-
-            // k_t.matmul(&state) is equivalent to broadcast_mul + sum(2)
-            let kv_mem = k_t.matmul(&last_recurrent_state)?; // (B, H, 1, V)
-            let delta = (&v_t - &kv_mem)?.broadcast_mul(&beta_t)?; // (B, H, 1, V)
-
-            // k_t.T.matmul(&delta) is equivalent to outer product
-            let delta_k = k_t.transpose(2, 3)?.matmul(&delta)?; // (B, H, K, 1) x (B, H, 1, V) = (B, H, K, V)
-            last_recurrent_state = (&last_recurrent_state + &delta_k)?;
-
-            let out_t = q_t.matmul(&last_recurrent_state)?; // (B, H, 1, V)
-            core_attn_out_vec.push(out_t);
-        }
-
-        let core_attn_out = Tensor::cat(&core_attn_out_vec, 2)?; // (B, H, S, V)
-        let core_attn_out = core_attn_out.transpose(1, 2)?; // (B, S, H, V)
-        Ok((core_attn_out, last_recurrent_state))
+        let output = if seq_len == 1 {
+            sequential_step(
+                &query.squeeze(1)?,
+                &key.squeeze(1)?,
+                &value.squeeze(1)?,
+                &log_g.squeeze(1)?.exp()?,
+                &beta.squeeze(1)?,
+                &mut state,
+            )?
+            .unsqueeze(1)?
+        } else {
+            gated_delta_rule_chunked(&query, &key, &value, &log_g, &beta, &mut state)?
+        };
+        Ok((output, state))
     }
 
     pub fn forward(&mut self, hidden_states: &Tensor) -> Result<Tensor> {
@@ -397,26 +396,27 @@ impl Qwen3_5GatedDeltaNet {
         let b = self.in_proj_b.forward(&hidden_states)?;
         let a = self.in_proj_a.forward(&hidden_states)?;
 
-        let use_precomputed_states = self.conv_state.is_some() && seq_len == 1;
+        // A cached state is continued for any number of new tokens: one decode
+        // step, or a multi-token chunk after a cached prefix (Kev's question rows
+        // continue the cached state of the document). Only a fresh cache starts
+        // from zeros.
+        let use_precomputed_states = self.conv_state.is_some();
 
-        let mixed_qkv = if use_precomputed_states {
-            let conv_state = self.conv_state.as_mut().unwrap();
-            let conv_state_data = Tensor::cat(&[&*conv_state, &mixed_qkv], 2)?;
-            *conv_state = conv_state_data.narrow(2, 1, self.conv_kernel_size - 1)?;
-            let out = depthwise_conv1d(&conv_state_data, self.conv1d.weight())?;
-            candle_nn::ops::silu(&out)?
-        } else {
-            let pad = self.conv_kernel_size - 1;
-            let padding = Tensor::zeros(
+        let pad = self.conv_kernel_size - 1;
+        let history = match &self.conv_state {
+            Some(conv_state) => conv_state.clone(),
+            None => Tensor::zeros(
                 (batch_size, self.conv_dim, pad),
                 mixed_qkv.dtype(),
                 mixed_qkv.device(),
-            )?;
-            let padded_qkv = Tensor::cat(&[&padding, &mixed_qkv], 2)?;
-            self.conv_state = Some(padded_qkv.narrow(2, seq_len, pad)?);
-            let out = depthwise_conv1d(&padded_qkv, self.conv1d.weight())?;
-            candle_nn::ops::silu(&out)?
+            )?,
         };
+        let padded_qkv = Tensor::cat(&[&history, &mixed_qkv], 2)?;
+        // A copy, not a view: a view would keep the whole padded input alive and
+        // hand the next chunk a strided history.
+        self.conv_state = Some(padded_qkv.narrow(2, seq_len, pad)?.contiguous()?);
+        let mixed_qkv =
+            candle_nn::ops::silu(&depthwise_conv1d(&padded_qkv, self.conv1d.weight())?)?;
 
         let mixed_qkv = mixed_qkv.transpose(1, 2)?; // (batch, seq, conv_dim)
 
@@ -447,7 +447,7 @@ impl Qwen3_5GatedDeltaNet {
         };
 
         let (core_attn_out, new_state) =
-            self.torch_recurrent_gated_delta_rule(&q, &k, &v, &g, &beta, initial_state)?;
+            self.gated_delta_rule(&q, &k, &v, &g, &beta, initial_state)?;
         self.recurrent_state = Some(new_state);
 
         let core_attn_out = core_attn_out.to_dtype(initial_dtype)?;
@@ -469,7 +469,7 @@ pub struct Qwen3_5TextRotaryEmbedding {
 
 impl Qwen3_5TextRotaryEmbedding {
     pub fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
-        let dim = (cfg.head_dim() as f64 * cfg.text_config.partial_rotary_factor) as usize;
+        let dim = (cfg.head_dim() as f64 * cfg.partial_rotary_factor()) as usize;
         if dim == 0 || dim > cfg.head_dim() || !dim.is_multiple_of(2) {
             candle::bail!(
                 "invalid Qwen 3.5 rotary dimension {dim} for head dimension {}",
@@ -482,14 +482,17 @@ impl Qwen3_5TextRotaryEmbedding {
             .map(|i| 1f32 / cfg.rope_theta().powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
+        // Positions and angles in f32, then the tables in the model dtype: bf16
+        // and f16 cannot hold the positions themselves (bf16 is exact only up
+        // to 256), so computing the angles in them rounds every later position.
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
             rotary_dim: dim,
         })
     }
@@ -507,17 +510,17 @@ impl Qwen3_5TextRotaryEmbedding {
             if self.rotary_dim == x.dim(D::Minus1)? {
                 Ok(rotated)
             } else {
-                Tensor::cat(
-                    &[
-                        &rotated,
-                        &x.narrow(
-                            D::Minus1,
-                            self.rotary_dim,
-                            x.dim(D::Minus1)? - self.rotary_dim,
-                        )?,
-                    ],
-                    D::Minus1,
-                )
+                // Both halves contiguous, so `cat` takes its contiguous path (as in
+                // quantized_qwen3_5): a strided pass-through half leaves q in a
+                // layout Metal's matmul rejects ("Invalid matmul arguments").
+                let pass = x
+                    .narrow(
+                        D::Minus1,
+                        self.rotary_dim,
+                        x.dim(D::Minus1)? - self.rotary_dim,
+                    )?
+                    .contiguous()?;
+                Tensor::cat(&[&rotated, &pass], D::Minus1)
             }
         };
         let q_embed = apply(q)?;
@@ -1085,6 +1088,29 @@ impl Qwen3_5DecoderLayer {
         residual + mlp_states
     }
 
+    fn repeat_cache(&mut self, n: usize) -> Result<()> {
+        match &mut self.token_mixer {
+            TokenMixer::FullAttention(attn) => {
+                if let Some((k, v)) = &attn.kv_cache {
+                    attn.kv_cache = Some((repeat_batch(k, n)?, repeat_batch(v, n)?));
+                }
+            }
+            TokenMixer::LinearAttention(attn) => {
+                attn.conv_state = attn
+                    .conv_state
+                    .as_ref()
+                    .map(|t| repeat_batch(t, n))
+                    .transpose()?;
+                attn.recurrent_state = attn
+                    .recurrent_state
+                    .as_ref()
+                    .map(|t| repeat_batch(t, n))
+                    .transpose()?;
+            }
+        }
+        Ok(())
+    }
+
     fn clear_kv_cache(&mut self) {
         match &mut self.token_mixer {
             TokenMixer::FullAttention(attn) => attn.kv_cache = None,
@@ -1199,7 +1225,7 @@ impl Model {
             .collect();
         let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
         let mask = if seqlen_offset > 0 {
-            let mask0 = Tensor::zeros((tgt_len, seqlen_offset), self.dtype, &self.device)?;
+            let mask0 = Tensor::zeros((tgt_len, seqlen_offset), DType::F32, &self.device)?;
             Tensor::cat(&[&mask0, &mask], D::Minus1)?
         } else {
             mask
@@ -1227,6 +1253,17 @@ impl Model {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache();
         }
+    }
+
+    /// Repeats a batch-1 cache `n` times, so that `n` rows continue the same
+    /// cached prefix in one forward (Kev's question rows after the document).
+    /// Rows of different lengths are right-padded: every layer is causal, so
+    /// the padding never reaches a real token.
+    pub fn repeat_cache(&mut self, n: usize) -> Result<()> {
+        for layer in self.layers.iter_mut() {
+            layer.repeat_cache(n)?;
+        }
+        Ok(())
     }
 }
 
@@ -1348,6 +1385,7 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_parameters: RopeParameters {
                     rope_theta: 10_000.,
+                    partial_rotary_factor: None,
                 },
                 attention_bias,
                 hidden_act: Activation::Silu,
@@ -1449,6 +1487,71 @@ mod tests {
             dense.forward(&tokens, 0)?.to_vec3::<f32>()?,
             custom.forward(&tokens, 0)?.to_vec3::<f32>()?,
         );
+        Ok(())
+    }
+
+    /// The tiny two-layer model (one attention, one DeltaNet layer) with random weights.
+    fn random_model(device: &Device) -> Result<Model> {
+        let varmap = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let mut cfg = tiny_config(false);
+        cfg.text_config.max_position_embeddings = 32;
+        let model = Model::new(&cfg, vb)?;
+        for (i, var) in varmap.all_vars().iter().enumerate() {
+            let seed =
+                Tensor::arange(0u32, var.elem_count() as u32, device)?.to_dtype(DType::F32)?;
+            // deterministic, varied values in (-0.5, 0.5)
+            let values = ((seed * (0.618_034 + i as f64 * 0.137))?.sin()? * 0.5)?;
+            var.set(&values.reshape(var.shape())?)?;
+        }
+        Ok(model)
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
+        (a - b)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()
+    }
+
+    #[test]
+    fn continuing_a_cached_prefix_matches_one_pass() -> Result<()> {
+        // Kev's question rows: the state runs once and each row continues its cache
+        // with several tokens at once. Both layer kinds must carry the cache across.
+        let device = Device::Cpu;
+        let model = random_model(&device)?;
+        let (state, row) = ([1u32, 2, 3, 4, 5], [6u32, 7, 1, 3]);
+        let all: Vec<u32> = state.iter().chain(&row).copied().collect();
+        let one_pass = model
+            .clone()
+            .forward(&Tensor::new(all.as_slice(), &device)?.unsqueeze(0)?, 0)?
+            .narrow(1, state.len(), row.len())?;
+        let mut cached = model.clone();
+        cached.forward(&Tensor::new(&state[..], &device)?.unsqueeze(0)?, 0)?;
+        let continued =
+            cached.forward(&Tensor::new(&row[..], &device)?.unsqueeze(0)?, state.len())?;
+        assert!(max_abs_diff(&one_pass, &continued)? < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn rows_on_a_repeated_cache_match_rows_one_at_a_time() -> Result<()> {
+        // Two rows of different lengths continue one cached prefix in a single
+        // right-padded batch; the padding comes after every real token.
+        let device = Device::Cpu;
+        let model = random_model(&device)?;
+        let state = [1u32, 2, 3];
+        let mut cached = model.clone();
+        cached.forward(&Tensor::new(&state[..], &device)?.unsqueeze(0)?, 0)?;
+        let rows: [&[u32]; 2] = [&[4, 5, 6, 7], &[6, 2]];
+        let mut batch = cached.clone();
+        batch.repeat_cache(2)?;
+        let ids = Tensor::new(&[[4u32, 5, 6, 7], [6, 2, 0, 0]], &device)?;
+        let batched = batch.forward(&ids, state.len())?;
+        for (i, row) in rows.iter().enumerate() {
+            let alone = cached
+                .clone()
+                .forward(&Tensor::new(*row, &device)?.unsqueeze(0)?, state.len())?;
+            let in_batch = batched.get(i)?.narrow(0, 0, row.len())?.unsqueeze(0)?;
+            assert!(max_abs_diff(&alone, &in_batch)? < 1e-5);
+        }
         Ok(())
     }
 

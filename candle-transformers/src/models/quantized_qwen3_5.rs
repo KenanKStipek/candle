@@ -48,6 +48,16 @@ impl<R: Read + Seek> Gguf<R> {
     }
 }
 
+/// `[1, ...]` -> `[n, ...]`: one cached prefix shared by `n` rows of a batch.
+fn repeat_batch(t: &Tensor, n: usize) -> Result<Tensor> {
+    let mut dims = t.dims().to_vec();
+    if dims.first() != Some(&1) {
+        candle::bail!("repeat_cache needs a batch-1 cache, got {:?}", t.shape())
+    }
+    dims[0] = n;
+    t.broadcast_as(dims)?.contiguous()
+}
+
 #[derive(Debug, Clone)]
 struct MlpWeights {
     gate_proj: QMatMul,
@@ -89,7 +99,7 @@ pub struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     pub fn new(
-        dtype: DType,
+        _dtype: DType,
         head_dim: usize,
         rotary_dim: usize,
         max_position_embeddings: usize,
@@ -108,9 +118,12 @@ impl RotaryEmbedding {
             .map(|i| 1f32 / rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
+        // Positions and angles in f32 whatever the model dtype: f16 holds
+        // integers exactly only up to 2048, so f16 tables put every later
+        // position at a rounded angle. `apply` casts to the activations' dtype.
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         Ok(Self {
@@ -138,7 +151,11 @@ impl RotaryEmbedding {
                 // leaves q laid out [d][h][s], which Metal's matmul rejects
                 // ("Invalid matmul arguments") on candle 0.10.2.
                 let pass = x
-                    .narrow(D::Minus1, self.rotary_dim, x.dim(D::Minus1)? - self.rotary_dim)?
+                    .narrow(
+                        D::Minus1,
+                        self.rotary_dim,
+                        x.dim(D::Minus1)? - self.rotary_dim,
+                    )?
                     .contiguous()?;
                 Tensor::cat(&[&rotated, &pass], D::Minus1)
             }
@@ -325,15 +342,17 @@ impl GatedDeltaNetWeights {
             .dequantize(&gg.device)?
             .unsqueeze(1)?;
 
-        let a_log = gg
+        // llama.cpp's converter stores `ssm_a` as A = -exp(A_log) already
+        // (convert_hf_to_gguf, Qwen3NextModel.modify_tensors), not as A_log.
+        let neg_a_f32 = gg
             .tensor(&format!("{prefix}.ssm_a"))?
-            .dequantize(&gg.device)?;
+            .dequantize(&gg.device)?
+            .to_dtype(DType::F32)?;
         let dt_bias = gg
             .tensor(&format!("{prefix}.ssm_dt.bias"))?
             .dequantize(&gg.device)?;
 
         let dt_bias_f32 = dt_bias.to_dtype(DType::F32)?;
-        let neg_a_f32 = (&a_log.to_dtype(DType::F32)?.exp()? * -1.0)?;
 
         let norm_weight = gg
             .tensor(&format!("{prefix}.ssm_norm.weight"))?
@@ -441,26 +460,26 @@ impl GatedDeltaNetWeights {
         let b = self.in_proj_b.forward(hidden_states)?;
         let a = self.in_proj_a.forward(hidden_states)?;
 
-        let use_precomputed_states = self.conv_state.is_some() && seq_len == 1;
+        // A cached state is continued for any number of new tokens: one decode
+        // step, or a multi-token chunk after a cached prefix (Kev's question rows
+        // continue the cached state of the document). Only a fresh cache starts
+        // from zeros.
+        let use_precomputed_states = self.conv_state.is_some();
 
-        let mixed_qkv = if use_precomputed_states {
-            let conv_state = self.conv_state.as_mut().unwrap();
-            let conv_state_data = Tensor::cat(&[&*conv_state, &mixed_qkv], 2)?;
-            *conv_state = conv_state_data.narrow(2, 1, self.conv_kernel_size - 1)?;
-            let out = depthwise_conv1d(&conv_state_data, &self.conv1d_weight)?;
-            candle_nn::ops::silu(&out)?
-        } else {
-            let pad = self.conv_kernel_size - 1;
-            let padding = Tensor::zeros(
+        let pad = self.conv_kernel_size - 1;
+        let history = match &self.conv_state {
+            Some(conv_state) => conv_state.clone(),
+            None => Tensor::zeros(
                 (batch_size, self.conv_dim, pad),
                 mixed_qkv.dtype(),
                 mixed_qkv.device(),
-            )?;
-            let padded_qkv = Tensor::cat(&[&padding, &mixed_qkv], 2)?;
-            self.conv_state = Some(padded_qkv.narrow(2, seq_len, pad)?);
-            let out = depthwise_conv1d(&padded_qkv, &self.conv1d_weight)?;
-            candle_nn::ops::silu(&out)?
+            )?,
         };
+        let padded_qkv = Tensor::cat(&[&history, &mixed_qkv], 2)?;
+        // A copy, not a view: a view would keep the whole padded input alive and
+        // hand the next chunk a strided history.
+        self.conv_state = Some(padded_qkv.narrow(2, seq_len, pad)?.contiguous()?);
+        let mixed_qkv = candle_nn::ops::silu(&depthwise_conv1d(&padded_qkv, &self.conv1d_weight)?)?;
 
         let mixed_qkv = mixed_qkv.transpose(1, 2)?;
 
@@ -518,7 +537,6 @@ impl GatedDeltaNetWeights {
         self.recurrent_state = None;
     }
 }
-
 
 #[derive(Debug, Clone)]
 enum TokenMixer {
@@ -615,6 +633,31 @@ impl LayerWeights {
             TokenMixer::FullAttention(attn) => attn.clear_kv_cache(),
             TokenMixer::LinearAttention(attn) => attn.clear_kv_cache(),
         }
+    }
+
+    fn repeat_cache(&mut self, n: usize) -> Result<()> {
+        match &mut self.token_mixer {
+            TokenMixer::FullAttention(attn) => {
+                if let (Some(k), Some(v)) = (attn.kv_cache.k(), attn.kv_cache.v()) {
+                    let (k, v) = (repeat_batch(k, n)?, repeat_batch(v, n)?);
+                    attn.kv_cache.reset();
+                    attn.kv_cache.append(&k, &v)?;
+                }
+            }
+            TokenMixer::LinearAttention(attn) => {
+                attn.conv_state = attn
+                    .conv_state
+                    .as_ref()
+                    .map(|t| repeat_batch(t, n))
+                    .transpose()?;
+                attn.recurrent_state = attn
+                    .recurrent_state
+                    .as_ref()
+                    .map(|t| repeat_batch(t, n))
+                    .transpose()?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -744,10 +787,15 @@ impl ModelWeights {
         let mask: Vec<_> = (0..tgt)
             .flat_map(|i| (0..(tgt + offset)).map(move |j| if j <= i + offset { 0. } else { minf }))
             .collect();
-        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+        Tensor::from_slice(&mask, (1, 1, tgt, tgt + offset), &self.device)?
+            .expand((b, 1, tgt, tgt + offset))?
+            .to_dtype(self.dtype)
     }
 
-    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+    /// Final-norm hidden states of every position, `[b, l, hidden]`, continuing
+    /// the cache at `offset`. For readouts over token positions (Kev's pointer
+    /// head) rather than next-token logits.
+    pub fn forward_hidden(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
         let causal_mask = if l == 1 {
@@ -758,7 +806,12 @@ impl ModelWeights {
         for layer in &mut self.layers {
             h = layer.forward(&h, causal_mask.as_ref(), offset)?;
         }
-        let h = self.norm.forward(&h)?;
+        self.norm.forward(&h)
+    }
+
+    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        let l = input.dim(1)?;
+        let h = self.forward_hidden(input, offset)?;
         let last_hidden = h.narrow(1, l - 1, 1)?;
         self.lm_head.forward(&last_hidden)?.squeeze(1)
     }
@@ -767,5 +820,16 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
+    }
+
+    /// Repeats a batch-1 cache `n` times, so that `n` rows continue the same
+    /// cached prefix in one forward (Kev's question rows after the document).
+    /// Rows of different lengths are right-padded: every layer is causal, so
+    /// the padding never reaches a real token.
+    pub fn repeat_cache(&mut self, n: usize) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.repeat_cache(n)?;
+        }
+        Ok(())
     }
 }
